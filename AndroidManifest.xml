@@ -1,0 +1,427 @@
+package com.broadcastdesk
+
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import com.broadcastdesk.service.CameraOverlayService
+import com.broadcastdesk.service.ScreenRecordService
+
+private val BgColor = Color(0xFF12161D)
+private val PanelColor = Color(0xFF1B212B)
+private val RaisedColor = Color(0xFF232B37)
+private val LineColor = Color(0xFF2D3746)
+private val TextColor = Color(0xFFE9ECF1)
+private val MutedColor = Color(0xFF8B93A3)
+private val AccentRed = Color(0xFFE8483B)
+private val AccentTeal = Color(0xFF3FA796)
+private val AccentAmber = Color(0xFFE0A83F)
+
+class MainActivity : ComponentActivity() {
+
+    private lateinit var mediaProjectionManager: MediaProjectionManager
+    private var highContrast by mutableStateOf(false)
+
+    private val screenCaptureLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            val intent = Intent(this, ScreenRecordService::class.java).apply {
+                action = ScreenRecordService.ACTION_START
+                putExtra(ScreenRecordService.EXTRA_RESULT_CODE, result.resultCode)
+                putExtra(ScreenRecordService.EXTRA_RESULT_DATA, result.data)
+                putExtra(ScreenRecordService.EXTRA_WITH_MIC, RecorderState.isMicOn.value)
+            }
+            ContextCompat.startForegroundService(this, intent)
+        } else {
+            RecorderState.announce("Screen capture permission was declined")
+        }
+    }
+
+    private val micPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        RecorderState.isMicOn.value = granted
+        RecorderState.announce(if (granted) "Microphone on" else "Microphone permission declined")
+    }
+
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) startCameraBubbleAfterPermissions() else
+            RecorderState.announce("Camera permission declined")
+    }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* no-op: recording still works without notification visibility */ }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        mediaProjectionManager =
+            getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        setContent {
+            val darkColors = darkColorScheme(
+                primary = AccentTeal,
+                background = if (highContrast) Color.Black else BgColor,
+                surface = if (highContrast) Color.Black else PanelColor,
+                onBackground = Color.White,
+                onSurface = Color.White,
+            )
+            MaterialTheme(colorScheme = darkColors) {
+                BroadcastDeskScreen(
+                    highContrast = highContrast,
+                    onToggleContrast = { highContrast = !highContrast },
+                    onToggleScreen = ::onToggleScreen,
+                    onToggleCamera = ::onToggleCamera,
+                    onToggleMic = ::onToggleMic,
+                    onSetPosition = { RecorderState.bubblePosition.value = it },
+                    onSetSize = { RecorderState.bubbleSize.value = it },
+                    onToggleRecord = ::onToggleRecord
+                )
+            }
+        }
+    }
+
+    private fun onToggleScreen() {
+        if (RecorderState.isScreenRecording.value) {
+            val intent = Intent(this, ScreenRecordService::class.java).apply {
+                action = ScreenRecordService.ACTION_STOP
+            }
+            startService(intent)
+        } else {
+            screenCaptureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
+        }
+    }
+
+    private fun onToggleCamera() {
+        if (RecorderState.isCameraBubbleOn.value) {
+            startService(Intent(this, CameraOverlayService::class.java).apply {
+                action = CameraOverlayService.ACTION_STOP
+            })
+            return
+        }
+        if (!Settings.canDrawOverlays(this)) {
+            RecorderState.announce("Allow \"display over other apps\" for Broadcast Desk, then try again")
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName")
+            )
+            startActivity(intent)
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            return
+        }
+        startCameraBubbleAfterPermissions()
+    }
+
+    private fun startCameraBubbleAfterPermissions() {
+        val intent = Intent(this, CameraOverlayService::class.java).apply {
+            action = CameraOverlayService.ACTION_START
+        }
+        ContextCompat.startForegroundService(this, intent)
+    }
+
+    private fun onToggleMic() {
+        if (RecorderState.isMicOn.value) {
+            RecorderState.isMicOn.value = false
+            RecorderState.announce("Microphone off")
+        } else if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            RecorderState.isMicOn.value = true
+            RecorderState.announce("Microphone on")
+        } else {
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    private fun onToggleRecord() {
+        onToggleScreen()
+    }
+}
+
+@Composable
+fun BroadcastDeskScreen(
+    highContrast: Boolean,
+    onToggleContrast: () -> Unit,
+    onToggleScreen: () -> Unit,
+    onToggleCamera: () -> Unit,
+    onToggleMic: () -> Unit,
+    onSetPosition: (BubblePosition) -> Unit,
+    onSetSize: (BubbleSize) -> Unit,
+    onToggleRecord: () -> Unit
+) {
+    val isRecording by RecorderState.isScreenRecording.collectAsState()
+    val isCameraOn by RecorderState.isCameraBubbleOn.collectAsState()
+    val isMicOn by RecorderState.isMicOn.collectAsState()
+    val status by RecorderState.statusMessage.collectAsState()
+    val elapsed by RecorderState.elapsedMs.collectAsState()
+    val position by RecorderState.bubblePosition.collectAsState()
+
+    val bg = if (highContrast) Color.Black else BgColor
+    val panel = if (highContrast) Color(0xFF0A0A0A) else PanelColor
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(bg)
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        // Header
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .background(panel, RoundedCornerShape(10.dp))
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier
+                    .size(18.dp)
+                    .background(
+                        if (isRecording) AccentRed else Color(0xFF5A2620),
+                        RoundedCornerShape(50)
+                    )
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Broadcast Desk", color = TextColor, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    "Screen + camera recorder, built for accessible use",
+                    color = MutedColor, fontSize = 13.sp
+                )
+            }
+            Text(
+                formatTime(elapsed),
+                color = TextColor, fontSize = 18.sp, fontWeight = FontWeight.Medium
+            )
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        // Accessibility bar
+        Row(Modifier.fillMaxWidth()) {
+            AccessibleToggleChip(
+                label = "High contrast",
+                pressed = highContrast,
+                onClick = onToggleContrast
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        // Live status region, announced by screen readers whenever it changes
+        Text(
+            status,
+            color = AccentTeal,
+            fontSize = 14.sp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .semantics { liveRegion = LiveRegionMode.Polite }
+                .padding(bottom = 12.dp)
+        )
+
+        SectionCard(title = "Sources", panelColor = panel) {
+            BigButton(
+                label = if (isRecording) "Remove screen share" else "Add screen share",
+                active = isRecording,
+                onClick = onToggleScreen
+            )
+            Spacer(Modifier.height(8.dp))
+            BigButton(
+                label = if (isCameraOn) "Remove camera bubble" else "Add camera bubble",
+                active = isCameraOn,
+                onClick = onToggleCamera
+            )
+            Spacer(Modifier.height(8.dp))
+            BigButton(
+                label = if (isMicOn) "Microphone: on" else "Microphone: off",
+                active = isMicOn,
+                onClick = onToggleMic
+            )
+        }
+
+        SectionCard(title = "Camera bubble position", panelColor = panel) {
+            val positions = listOf(
+                BubblePosition.TOP_LEFT to "Top left",
+                BubblePosition.TOP_RIGHT to "Top right",
+                BubblePosition.BOTTOM_LEFT to "Bottom left",
+                BubblePosition.BOTTOM_RIGHT to "Bottom right",
+            )
+            Column {
+                for (row in positions.chunked(2)) {
+                    Row(Modifier.fillMaxWidth()) {
+                        for ((pos, label) in row) {
+                            PositionButton(
+                                label = label,
+                                selected = position == pos,
+                                modifier = Modifier.weight(1f).padding(4.dp),
+                                onClick = { onSetPosition(pos) }
+                            )
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Row {
+                SizeButton("Small", BubbleSize.SMALL, onSetSize)
+                SizeButton("Medium", BubbleSize.MEDIUM, onSetSize)
+                SizeButton("Large", BubbleSize.LARGE, onSetSize)
+            }
+        }
+
+        SectionCard(title = "Recording", panelColor = panel) {
+            Button(
+                onClick = onToggleRecord,
+                enabled = true,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (isRecording) RaisedColor else AccentRed,
+                    contentColor = if (isRecording) AccentRed else Color.White
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+            ) {
+                Text(
+                    if (isRecording) "Stop recording" else "Start recording",
+                    fontWeight = FontWeight.Bold, fontSize = 16.sp
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "The camera bubble is a real overlay window, so anything visible on your " +
+                    "screen — including it — gets captured automatically. Recordings save to " +
+                    "Movies as an MP4 file.",
+                color = MutedColor, fontSize = 12.sp
+            )
+        }
+
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun SectionCard(title: String, panelColor: Color, content: @Composable ColumnScope.() -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(panelColor, RoundedCornerShape(10.dp))
+            .padding(16.dp)
+    ) {
+        Text(
+            title.uppercase(),
+            color = MutedColor,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(bottom = 10.dp)
+        )
+        content()
+    }
+    Spacer(Modifier.height(14.dp))
+}
+
+@Composable
+private fun BigButton(label: String, active: Boolean, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (active) Color(0x243FA796) else RaisedColor,
+            contentColor = if (active) AccentTeal else TextColor
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 52.dp)
+    ) {
+        Text(label, fontSize = 15.sp)
+    }
+}
+
+@Composable
+private fun PositionButton(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        modifier = modifier.heightIn(min = 48.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (selected) Color(0x26E0A83F) else RaisedColor,
+            contentColor = if (selected) AccentAmber else TextColor
+        )
+    ) {
+        Text(label, fontSize = 13.sp)
+    }
+}
+
+@Composable
+private fun RowScope.SizeButton(label: String, size: BubbleSize, onSetSize: (BubbleSize) -> Unit) {
+    val current by RecorderState.bubbleSize.collectAsState()
+    Button(
+        onClick = { onSetSize(size) },
+        modifier = Modifier.weight(1f).padding(horizontal = 4.dp).heightIn(min = 46.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (current == size) Color(0x243FA796) else RaisedColor,
+            contentColor = if (current == size) AccentTeal else TextColor
+        )
+    ) {
+        Text(label, fontSize = 13.sp)
+    }
+}
+
+@Composable
+private fun AccessibleToggleChip(label: String, pressed: Boolean, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (pressed) AccentTeal else RaisedColor,
+            contentColor = if (pressed) Color.Black else TextColor
+        ),
+        modifier = Modifier.heightIn(min = 44.dp)
+    ) {
+        Text(label, fontSize = 13.sp)
+    }
+}
+
+private fun formatTime(ms: Long): String {
+    val totalSeconds = ms / 1000
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%02d:%02d".format(minutes, seconds)
+}
